@@ -46,6 +46,12 @@
 
 #include "anet.h"
 
+union sockaddr_u {
+    struct sockaddr sa;
+    struct sockaddr_in in;
+    struct sockaddr_in6 in6;
+};
+
 static void anetSetError(char *err, const char *fmt, ...)
 {
     va_list ap;
@@ -105,22 +111,46 @@ int anetTcpKeepAlive(char *err, int fd)
     return ANET_OK;
 }
 
-int anetResolve(char *err, char *host, char *ipbuf)
+int anetResolve(char *err, const char *host, char *ipbuf, const socklen_t buflen, int prefer_family)
 {
-    struct sockaddr_in sa;
+    struct addrinfo hints, *res, *ai;
+    int found = 0;
 
-    sa.sin_family = AF_INET;
-    if (inet_aton(host, &sa.sin_addr) == 0) {
-        struct hostent *he;
-
-        he = gethostbyname(host);
-        if (he == NULL) {
-            anetSetError(err, "can't resolve: %s", host);
-            return ANET_ERR;
-        }
-        memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) {
+        anetSetError(err, "can't resolve: %s", host);
+        return ANET_ERR;
     }
-    strcpy(ipbuf,inet_ntoa(sa.sin_addr));
+
+    ai = res;
+    while (ai) {
+        switch (ai->ai_addr->sa_family) {
+            case AF_INET:
+                inet_ntop(AF_INET,
+                          &(((struct sockaddr_in *)ai->ai_addr)->sin_addr),
+                          ipbuf, buflen);
+                found = AF_INET;
+                break;
+            case AF_INET6:
+                inet_ntop(AF_INET6,
+                          &(((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr),
+                          ipbuf, buflen);
+                found = AF_INET6;
+                break;
+        }
+        if ((prefer_family && found == prefer_family) ||
+                (prefer_family == AF_UNSPEC || prefer_family == 0))
+            break;
+        ai = ai->ai_next;
+    }
+    freeaddrinfo(res);
+
+    if (!found) {
+        anetSetError(err, "no suitable address entries: %s", host);
+        return ANET_ERR;
+    }
     return ANET_OK;
 }
 
@@ -144,38 +174,50 @@ static int anetCreateSocket(char *err, int domain) {
 #define ANET_CONNECT_NONBLOCK 1
 static int anetTcpGenericConnect(char *err, char *addr, int port, int flags)
 {
-    int s;
-    struct sockaddr_in sa;
+    int s = ANET_ERR, saved_errno = 0;
+    struct addrinfo hints, *res, *ai;
+    char s_port[6];
 
-    if ((s = anetCreateSocket(err,AF_INET)) == ANET_ERR)
+    if (port < 1 || port > 65535) {
+        anetSetError(err, "invalid port value: %d", port);
         return ANET_ERR;
+    }
+    sprintf(s_port, "%d", port);
 
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    if (inet_aton(addr, &sa.sin_addr) == 0) {
-        struct hostent *he;
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG;
+    if (getaddrinfo(addr, s_port, &hints, &res) != 0) {
+        anetSetError(err, "can't resolve: %s", addr);
+        return ANET_ERR;
+    }
 
-        he = gethostbyname(addr);
-        if (he == NULL) {
-            anetSetError(err, "can't resolve: %s", addr);
-            close(s);
-            return ANET_ERR;
+    ai = res;
+    while (ai) {
+        if ((s = anetCreateSocket(err, ai->ai_addr->sa_family)) != ANET_ERR) {
+            if (flags & ANET_CONNECT_NONBLOCK) {
+                if (anetNonBlock(err,s) != ANET_OK) {
+                    close(s);
+                    s = ANET_ERR;
+                }
+            }
+
+            if (s != ANET_ERR) {
+                if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0)
+                    break;
+                if (errno == EINPROGRESS &&
+                    flags & ANET_CONNECT_NONBLOCK)
+                    break;
+                saved_errno = errno;
+                close(s);
+                s = ANET_ERR;
+            }
         }
-        memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
+        ai = ai->ai_next;
     }
-    if (flags & ANET_CONNECT_NONBLOCK) {
-        if (anetNonBlock(err,s) != ANET_OK)
-            return ANET_ERR;
-    }
-    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
-        if (errno == EINPROGRESS &&
-            flags & ANET_CONNECT_NONBLOCK)
-            return s;
-
-        anetSetError(err, "connect: %s", strerror(errno));
-        close(s);
-        return ANET_ERR;
-    }
+    freeaddrinfo(res);
+    if (s == ANET_ERR)
+        anetSetError(err, "connect: %s", strerror(saved_errno));
     return s;
 }
 
@@ -291,6 +333,35 @@ int anetTcpServer(char *err, int port, char *bindaddr)
     return s;
 }
 
+int anetTcp6Server(char *err, int port, char *bindaddr)
+{
+    int s;
+    struct sockaddr_in6 sa;
+    int yes = 1;
+
+    if ((s = anetCreateSocket(err,AF_INET6)) == ANET_ERR)
+        return ANET_ERR;
+
+    if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)) == -1) {
+        anetSetError(err, "setsockopt IPV6_V6ONLY: %s", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+
+    memset(&sa,0,sizeof(sa));
+    sa.sin6_family = AF_INET6;
+    sa.sin6_port = htons(port);
+    sa.sin6_addr = in6addr_any;
+    if (bindaddr && inet_pton(AF_INET6, bindaddr, &sa.sin6_addr) != 1) {
+        anetSetError(err, "invalid bind address");
+        close(s);
+        return ANET_ERR;
+    }
+    if (anetListen(err,s,(struct sockaddr*)&sa,sizeof(sa)) == ANET_ERR)
+        return ANET_ERR;
+    return s;
+}
+
 int anetUnixServer(char *err, char *path)
 {
     int s;
@@ -326,13 +397,29 @@ static int anetGenericAccept(char *err, int s, struct sockaddr *sa, socklen_t *l
 
 int anetTcpAccept(char *err, int s, char *ip, int *port) {
     int fd;
-    struct sockaddr_in sa;
+    union sockaddr_u sa;
+
     socklen_t salen = sizeof(sa);
-    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
+    if ((fd = anetGenericAccept(err,s,&sa.sa,&salen)) == ANET_ERR)
         return ANET_ERR;
 
-    if (ip) strcpy(ip,inet_ntoa(sa.sin_addr));
-    if (port) *port = ntohs(sa.sin_port);
+    switch (sa.sa.sa_family) {
+        case AF_INET:
+            if (ip)
+                if (!inet_ntop(AF_INET, &sa.in.sin_addr, ip, 16))
+                    sprintf(ip, "<fail>");
+            if (port) *port = ntohs(sa.in.sin_port);
+            break;
+        case AF_INET6:
+            if (ip)
+                if (!inet_ntop(AF_INET6, &sa.in6.sin6_addr, ip, 128))
+                    sprintf(ip, "<fail>");
+            if (port) *port = ntohs(sa.in6.sin6_port);
+            break;
+        default:
+            if (ip) sprintf(ip, "<unknown family>");
+            if (port) *port = 0;
+    }
     return fd;
 }
 

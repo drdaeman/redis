@@ -98,38 +98,52 @@ static int redisSetTcpNoDelay(redisContext *c, int fd) {
 }
 
 int redisContextConnectTcp(redisContext *c, const char *addr, int port) {
-    int s;
+    int s, err = 0;
     int blocking = (c->flags & REDIS_BLOCK);
-    struct sockaddr_in sa;
+    struct addrinfo hints, *res, *ai;
+    char s_port[6];
 
-    if ((s = redisCreateSocket(c,AF_INET)) == REDIS_ERR)
+    if (port < 1 || port > 65535) {
+        __redisSetError(c,REDIS_ERR_OTHER,
+            sdscatprintf(sdsempty(),"Invalid port: %d",port));
         return REDIS_ERR;
-    if (!blocking && redisSetNonBlock(c,s) == REDIS_ERR)
+    }
+    sprintf(s_port, "%d", port);
+
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG;
+    if (getaddrinfo(addr, s_port, &hints, &res) != 0) {
+        __redisSetError(c,REDIS_ERR_OTHER,
+            sdscatprintf(sdsempty(),"Can't resolve: %s",addr));
         return REDIS_ERR;
-
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    if (inet_aton(addr, &sa.sin_addr) == 0) {
-        struct hostent *he;
-
-        he = gethostbyname(addr);
-        if (he == NULL) {
-            __redisSetError(c,REDIS_ERR_OTHER,
-                sdscatprintf(sdsempty(),"Can't resolve: %s",addr));
-            close(s);
-            return REDIS_ERR;
-        }
-        memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
     }
 
-    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
-        if (errno == EINPROGRESS && !blocking) {
-            /* This is ok. */
-        } else {
-            __redisSetError(c,REDIS_ERR_IO,NULL);
-            close(s);
-            return REDIS_ERR;
+    ai = res;
+    while (ai) {
+        if ((s = redisCreateSocket(c,ai->ai_addr->sa_family)) != REDIS_ERR) {
+            if (!blocking && redisSetNonBlock(c,s) == REDIS_ERR) {
+                close(s);
+                s = REDIS_ERR;
+            }
+
+            if (s != REDIS_ERR) {
+                if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0)
+                    break;
+                if (errno == EINPROGRESS && blocking)
+                    break;
+
+                close(s);
+                s = REDIS_ERR;
+            }
         }
+        ai = ai->ai_next;
+    }
+    freeaddrinfo(res);
+
+    if (s == REDIS_ERR) {
+        __redisSetError(c,REDIS_ERR_IO,NULL);
+        return REDIS_ERR;
     }
 
     if (redisSetTcpNoDelay(c,s) != REDIS_OK) {

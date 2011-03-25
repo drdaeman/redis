@@ -369,9 +369,12 @@ struct redisServer {
     aeEventLoop *el;
     /* Networking */
     int port;
+    int port6;
     char *bindaddr;
+    char *bindaddr6;
     char *unixsocket;
     int ipfd;
+    int ip6fd;
     int sofd;
     list *clients;
     list *slaves, *monitors;

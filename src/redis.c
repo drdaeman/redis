@@ -781,9 +781,12 @@ void createSharedObjects(void) {
 
 void initServerConfig() {
     server.port = REDIS_SERVERPORT;
+    server.port6 = REDIS_SERVERPORT;
     server.bindaddr = NULL;
+    server.bindaddr6 = NULL;
     server.unixsocket = NULL;
     server.ipfd = -1;
+    server.ip6fd = -1;
     server.sofd = -1;
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.verbosity = REDIS_VERBOSE;
@@ -880,7 +883,14 @@ void initServer() {
     if (server.port != 0) {
         server.ipfd = anetTcpServer(server.neterr,server.port,server.bindaddr);
         if (server.ipfd == ANET_ERR) {
-            redisLog(REDIS_WARNING, "Opening port: %s", server.neterr);
+            redisLog(REDIS_WARNING, "Opening IPv4 port: %s", server.neterr);
+            exit(1);
+        }
+    }
+    if (server.port6 != 0) {
+        server.ip6fd = anetTcp6Server(server.neterr,server.port6,server.bindaddr6);
+        if (server.ip6fd == ANET_ERR) {
+            redisLog(REDIS_WARNING, "Opening IPv6 port: %s", server.neterr);
             exit(1);
         }
     }
@@ -892,7 +902,7 @@ void initServer() {
             exit(1);
         }
     }
-    if (server.ipfd < 0 && server.sofd < 0) {
+    if (server.ipfd < 0 && server.sofd < 0 && server.ip6fd < 0) {
         redisLog(REDIS_WARNING, "Configured to not listen anywhere, exiting.");
         exit(1);
     }
@@ -931,6 +941,8 @@ void initServer() {
     server.unixtime = time(NULL);
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (server.ipfd > 0 && aeCreateFileEvent(server.el,server.ipfd,AE_READABLE,
+        acceptTcpHandler,NULL) == AE_ERR) oom("creating file event");
+    if (server.ip6fd > 0 && aeCreateFileEvent(server.el,server.ip6fd,AE_READABLE,
         acceptTcpHandler,NULL) == AE_ERR) oom("creating file event");
     if (server.sofd > 0 && aeCreateFileEvent(server.el,server.sofd,AE_READABLE,
         acceptUnixHandler,NULL) == AE_ERR) oom("creating file event");
@@ -1696,7 +1708,9 @@ int main(int argc, char **argv) {
             redisLog(REDIS_NOTICE,"DB loaded from disk: %.3f seconds",(float)(ustime()-start)/1000000);
     }
     if (server.ipfd > 0)
-        redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+        redisLog(REDIS_NOTICE,"The server is now ready to accept IPv4 connections on port %d", server.port);
+    if (server.ip6fd > 0)
+        redisLog(REDIS_NOTICE,"The server is now ready to accept IPv6 connections on port %d", server.port6);
     if (server.sofd > 0)
         redisLog(REDIS_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
     aeSetBeforeSleepProc(server.el,beforeSleep);

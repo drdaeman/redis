@@ -157,6 +157,9 @@ proc start_server {options {code undefined}} {
     # start every server on a different port
     dict set config port [incr ::port]
 
+    # do not listen on IPv6
+    dict set config port6 0
+
     # apply overrides from global space and arguments
     foreach {directive arguments} [concat $::global_overrides $overrides] {
         dict set config $directive $arguments
